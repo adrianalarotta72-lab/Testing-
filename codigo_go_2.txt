@@ -1,0 +1,236 @@
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+)
+
+type PackType struct {
+	Sizes []int
+	Costs []int
+}
+
+type Order struct {
+	Type   string
+	Target int
+}
+
+const INF = int(^uint(0) >> 1)
+
+// parseBoxData lee boxdata2.txt
+func parseBoxData(path string) (map[string]PackType, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	res := make(map[string]PackType)
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	var currType string
+	var sizes []int
+	var costs []int
+
+	flush := func() {
+		if currType != "" && len(sizes) > 0 && len(costs) == len(sizes) {
+			res[currType] = PackType{Sizes: sizes, Costs: costs}
+		}
+	}
+
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+
+		// Nueva sección: "A"
+		if len(line) == 1 && line[0] >= 'A' && line[0] <= 'Z' {
+			flush()
+			currType = line
+			sizes = nil
+			costs = nil
+			continue
+		}
+
+		// "Size: 5 10"
+		if strings.HasPrefix(line, "Size:") {
+			fields := strings.Fields(strings.TrimPrefix(line, "Size:"))
+			tmp := make([]int, 0, len(fields))
+			for _, s := range fields {
+				v, err := strconv.Atoi(s)
+				if err != nil {
+					return nil, fmt.Errorf("size inválido %q", s)
+				}
+				tmp = append(tmp, v)
+			}
+			sizes = tmp
+			continue
+		}
+
+		// "Cost: 31 19"
+		if strings.HasPrefix(line, "Cost:") {
+			fields := strings.Fields(strings.TrimPrefix(line, "Cost:"))
+			tmp := make([]int, 0, len(fields))
+			for _, s := range fields {
+				v, err := strconv.Atoi(s)
+				if err != nil {
+					return nil, fmt.Errorf("cost inválido %q", s)
+				}
+				tmp = append(tmp, v)
+			}
+			costs = tmp
+			continue
+		}
+	}
+
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	flush()
+
+	return res, nil
+}
+
+// parseOrders lee input2.txt
+func parseOrders(path string) ([]Order, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var orders []Order
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("línea inválida: %q", line)
+		}
+		t := parts[0]
+		n, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return nil, fmt.Errorf("target inválido en %q", line)
+		}
+		orders = append(orders, Order{Type: t, Target: n})
+	}
+	return orders, sc.Err()
+}
+
+// buildDP construye dpCost/dpBoxes para un tipo hasta maxTarget
+func buildDP(pt PackType, maxTarget int) (dpCost []int, dpBoxes []int) {
+	dpCost = make([]int, maxTarget+1)
+	dpBoxes = make([]int, maxTarget+1)
+
+	for i := 1; i <= maxTarget; i++ {
+		dpCost[i] = INF
+		dpBoxes[i] = INF
+	}
+	dpCost[0] = 0
+	dpBoxes[0] = 0
+
+	for x := 1; x <= maxTarget; x++ {
+		for j := 0; j < len(pt.Sizes); j++ {
+			sz := pt.Sizes[j]
+			c := pt.Costs[j]
+			if x-sz < 0 {
+				continue
+			}
+			if dpCost[x-sz] == INF {
+				continue
+			}
+			newCost := dpCost[x-sz] + c
+			newBoxes := dpBoxes[x-sz] + 1
+
+			// mejor por costo, tie-break por cajas
+			if newCost < dpCost[x] || (newCost == dpCost[x] && newBoxes < dpBoxes[x]) {
+				dpCost[x] = newCost
+				dpBoxes[x] = newBoxes
+			}
+		}
+	}
+
+	return dpCost, dpBoxes
+}
+
+func main() {
+	// Uso:
+	// go run main.go boxdata2.txt input2.txt
+	if len(os.Args) < 3 {
+		fmt.Println("Uso: go run main.go boxdata2.txt input2.txt")
+		os.Exit(1)
+	}
+
+	boxPath := os.Args[1]
+	ordersPath := os.Args[2]
+
+	boxData, err := parseBoxData(boxPath)
+	if err != nil {
+		panic(err)
+	}
+	orders, err := parseOrders(ordersPath)
+	if err != nil {
+		panic(err)
+	}
+
+	// 1) agrupar max target por tipo
+	maxByType := make(map[string]int)
+	for _, o := range orders {
+		if o.Target > maxByType[o.Type] {
+			maxByType[o.Type] = o.Target
+		}
+	}
+
+	// 2) construir DP por tipo (una sola vez por tipo)
+	type DP struct {
+		cost  []int
+		boxes []int
+	}
+	dpByType := make(map[string]DP)
+
+	for t, maxT := range maxByType {
+		pt, ok := boxData[t]
+		if !ok {
+			// Si el tipo no existe, simplemente ese tipo nunca se podrá cumplir
+			continue
+		}
+		cost, boxes := buildDP(pt, maxT)
+		dpByType[t] = DP{cost: cost, boxes: boxes}
+	}
+
+	// 3) resolver órdenes
+	totalBoxes := 0
+	fulfilled := 0
+
+	for _, o := range orders {
+		dp, ok := dpByType[o.Type]
+		if !ok {
+			continue // tipo inexistente
+		}
+		if o.Target < 0 || o.Target >= len(dp.cost) {
+			continue
+		}
+		if dp.cost[o.Target] == INF {
+			continue // no se puede exacto -> ignorar
+		}
+
+		// si quieres imprimir detalle por orden:
+		// fmt.Printf("%s %d -> boxes=%d cost=%d\n", o.Type, o.Target, dp.boxes[o.Target], dp.cost[o.Target])
+
+		totalBoxes += dp.boxes[o.Target]
+		fulfilled++
+	}
+
+	fmt.Printf("Fulfilled orders: %d / %d\n", fulfilled, len(orders))
+	fmt.Printf("Total boxes: %d\n", totalBoxes)
+}
