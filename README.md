@@ -1,79 +1,129 @@
-_ = s.Set("key1", "value1")
-	if s.Size() != 1 {
-		t.Errorf("After one insert Size() = %d, want 1", s.Size())
-	}
+package store
 
-	_ = s.Set("key2", "value2")
-	if s.Size() != 2 {
-		t.Errorf("After two inserts Size() = %d, want 2", s.Size())
-	}
+import (
+	"fmt"
+	"testing"
+)
 
-	_ = s.Delete("key1")
-	if s.Size() != 1 {
-		t.Errorf("After one delete Size() = %d, want 1", s.Size())
+func BenchmarkSet(b *testing.B) {
+	s := New()
+	key := "benchkey"
+	value := "benchvalue"
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = s.Set(key, value)
 	}
 }
 
-func TestClear(t *testing.T) {
+func BenchmarkGet(b *testing.B) {
 	s := New()
-	_ = s.Set("key1", "value1")
-	_ = s.Set("key2", "value2")
+	key := "benchkey"
+	value := "benchvalue"
+	_ = s.Set(key, value)
 
-	s.Clear()
-
-	if s.Size() != 0 {
-		t.Errorf("After Clear() Size() = %d, want 0", s.Size())
-	}
-
-	if s.Exists("key1") || s.Exists("key2") {
-		t.Error("Keys still exist after Clear()")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = s.Get(key)
 	}
 }
 
-func TestConcurrentAccess(t *testing.T) {
+func BenchmarkDelete(b *testing.B) {
 	s := New()
-	var wg sync.WaitGroup
+	key := "benchkey"
 
-	// Number of concurrent goroutines
-	numGoroutines := 100
-	numOperations := 1000
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		_ = s.Set(key, "value")
+		b.StartTimer()
 
-	wg.Add(numGoroutines * 3) // Set, Get, Delete operations
+		_ = s.Delete(key)
+	}
+}
 
-	// Concurrent Set operations
-	for i := 0; i < numGoroutines; i++ {
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < numOperations; j++ {
-				key := "key"
-				value := "value"
+func BenchmarkExists(b *testing.B) {
+	s := New()
+	key := "benchkey"
+	_ = s.Set(key, "value")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = s.Exists(key)
+	}
+}
+
+func BenchmarkSetParallel(b *testing.B) {
+	s := New()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			key := fmt.Sprintf("key%d", i)
+			value := fmt.Sprintf("value%d", i)
+			_ = s.Set(key, value)
+			i++
+		}
+	})
+}
+
+func BenchmarkGetParallel(b *testing.B) {
+	s := New()
+	// Prepopulate with some data
+	for i := 0; i < 1000; i++ {
+		_ = s.Set(fmt.Sprintf("key%d", i), fmt.Sprintf("value%d", i))
+	}
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			key := fmt.Sprintf("key%d", i%1000)
+			_, _ = s.Get(key)
+			i++
+		}
+	})
+}
+
+func BenchmarkMixedOperations(b *testing.B) {
+	s := New()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			key := fmt.Sprintf("key%d", i%100)
+			value := fmt.Sprintf("value%d", i)
+
+			switch i % 3 {
+			case 0:
 				_ = s.Set(key, value)
-			}
-		}(i)
-	}
-
-	// Concurrent Get operations
-	for i := 0; i < numGoroutines; i++ {
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < numOperations; j++ {
-				key := "key"
+			case 1:
 				_, _ = s.Get(key)
-			}
-		}(i)
-	}
-
-	// Concurrent Delete operations
-	for i := 0; i < numGoroutines; i++ {
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < numOperations; j++ {
-				key := "key"
+			case 2:
 				_ = s.Delete(key)
 			}
-		}(i)
-	}
+			i++
+		}
+	})
+}
 
-	wg.Wait()
-	// Test passes if no race conditions occur
+func BenchmarkStoreWithDifferentSizes(b *testing.B) {
+	sizes := []int{10, 100, 1000, 10000}
+
+	for _, size := range sizes {
+		b.Run(fmt.Sprintf("size_%d", size), func(b *testing.B) {
+			s := New()
+
+			// Prepopulate
+			for i := 0; i < size; i++ {
+				_ = s.Set(fmt.Sprintf("key%d", i), fmt.Sprintf("value%d", i))
+			}
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				key := fmt.Sprintf("key%d", i%size)
+				_, _ = s.Get(key)
+			}
+		})
+	}
 }
