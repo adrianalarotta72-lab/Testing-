@@ -1,129 +1,133 @@
-package store
+package handlers
 
 import (
+	"context"
 	"fmt"
-	"testing"
+	"log"
+	"net"
+	"strings"
+
+	"gitlab.com/your-username/your-repo-name/internal/store"
 )
 
-func BenchmarkSet(b *testing.B) {
-	s := New()
-	key := "benchkey"
-	value := "benchvalue"
+// UDPServer handles UDP requests for the key-value store.
+type UDPServer struct {
+	port string
+	store *store.Store
+	conn *net.UDPConn
+}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = s.Set(key, value)
+// NewUDPServer creates a new UDP server instance.
+func NewUDPServer(port string, s *store.Store) *UDPServer {
+	return &UDPServer{
+		port:  port,
+		store: s,
 	}
 }
 
-func BenchmarkGet(b *testing.B) {
-	s := New()
-	key := "benchkey"
-	value := "benchvalue"
-	_ = s.Set(key, value)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = s.Get(key)
+// Start initializes and starts the UDP server.
+func (u *UDPServer) Start(ctx context.Context) error {
+	addr, err := net.ResolveUDPAddr("udp", ":"+u.port)
+	if err != nil {
+		return fmt.Errorf("failed to resolve UDP address: %w", err)
 	}
-}
-
-func BenchmarkDelete(b *testing.B) {
-	s := New()
-	key := "benchkey"
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		b.StopTimer()
-		_ = s.Set(key, "value")
-		b.StartTimer()
-
-		_ = s.Delete(key)
+	
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		return fmt.Errorf("failed to start UDP server: %w", err)
 	}
-}
-
-func BenchmarkExists(b *testing.B) {
-	s := New()
-	key := "benchkey"
-	_ = s.Set(key, "value")
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = s.Exists(key)
-	}
-}
-
-func BenchmarkSetParallel(b *testing.B) {
-	s := New()
-
-	b.RunParallel(func(pb *testing.PB) {
-		i := 0
-		for pb.Next() {
-			key := fmt.Sprintf("key%d", i)
-			value := fmt.Sprintf("value%d", i)
-			_ = s.Set(key, value)
-			i++
+	
+	u.conn = conn
+	log.Printf("Starting UDP server on :%s", u.port)
+	
+	go func() {
+		<-ctx.Done()
+		
+		if err := u.conn.Close(); err != nil {
+			log.Printf("Error closing UDP connection: %v", err)
 		}
-	})
-}
-
-func BenchmarkGetParallel(b *testing.B) {
-	s := New()
-	// Prepopulate with some data
-	for i := 0; i < 1000; i++ {
-		_ = s.Set(fmt.Sprintf("key%d", i), fmt.Sprintf("value%d", i))
+	}()
+	
+	buffer := make([]byte, 1024)
+	
+	for {
+		n, clientAddr, err := conn.ReadFromUDP(buffer)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				log.Printf("Error reading UDP packet: %v", err)
+				continue
+			}
+		}
+		
+		command := string(buffer[:n])
+		response := u.processCommand(command)
+		
+		if _, err := conn.WriteToUDP([]byte(response), clientAddr); err != nil {
+			log.Printf("Error writing UDP response: %v", err)
+		}
 	}
-
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		i := 0
-		for pb.Next() {
-			key := fmt.Sprintf("key%d", i%1000)
-			_, _ = s.Get(key)
-			i++
-		}
-	})
 }
 
-func BenchmarkMixedOperations(b *testing.B) {
-	s := New()
-
-	b.RunParallel(func(pb *testing.PB) {
-		i := 0
-		for pb.Next() {
-			key := fmt.Sprintf("key%d", i%100)
-			value := fmt.Sprintf("value%d", i)
-
-			switch i % 3 {
-			case 0:
-				_ = s.Set(key, value)
-			case 1:
-				_, _ = s.Get(key)
-			case 2:
-				_ = s.Delete(key)
-			}
-			i++
+func (u *UDPServer) processCommand(command string) string {
+	command = strings.TrimSpace(command)
+	parts := strings.Split(command, ":")
+	
+	if len(parts) < 2 {
+		return "ERROR:Invalid command format"
+	}
+	
+	operation := strings.ToUpper(parts[0])
+	
+	switch operation {
+	case "GET":
+		if len(parts) != 2 {
+			return "ERROR:GET requires exactly one argument"
 		}
-	})
-}
-
-func BenchmarkStoreWithDifferentSizes(b *testing.B) {
-	sizes := []int{10, 100, 1000, 10000}
-
-	for _, size := range sizes {
-		b.Run(fmt.Sprintf("size_%d", size), func(b *testing.B) {
-			s := New()
-
-			// Prepopulate
-			for i := 0; i < size; i++ {
-				_ = s.Set(fmt.Sprintf("key%d", i), fmt.Sprintf("value%d", i))
-			}
-
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				key := fmt.Sprintf("key%d", i%size)
-				_, _ = s.Get(key)
-			}
-		})
+		
+		key := parts[1]
+		value, exists := u.store.Get(key)
+		if !exists {
+			return "ERROR:Key not found"
+		}
+		
+		return fmt.Sprintf("OK:%s", value)
+		
+	case "SET":
+		if len(parts) != 3 {
+			return "ERROR:SET requires exactly two arguments"
+		}
+		
+		key := parts[1]
+		value := parts[2]
+		u.store.Set(key, value)
+		
+		return "OK:Value stored"
+		
+	case "DELETE":
+		if len(parts) != 2 {
+			return "ERROR:DELETE requires exactly one argument"
+		}
+		
+		key := parts[1]
+		deleted := u.store.Delete(key)
+		if !deleted {
+			return "ERROR:Key not found"
+		}
+		
+		return "OK:Value deleted"
+		
+	case "KEYS":
+		keys := u.store.Keys()
+		if len(keys) == 0 {
+			return "OK:"
+		}
+		
+		return fmt.Sprintf("OK:%s", strings.Join(keys, ","))
+		
+	default:
+		return "ERROR:Unknown operation"
 	}
 }
