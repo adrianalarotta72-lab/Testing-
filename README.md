@@ -1,11 +1,4 @@
-HTTP Test 7: Error Case (key vacía)
-powershellInvoke-WebRequest -Method POST -Uri "http://localhost:8080/kv" `
-  -ContentType "application/json" `
-  -Body '{"operation":"GET","key":""}' | Select-Object -ExpandProperty Content
-Output esperado:
-json{"success":false,"error":"key cannot be empty"}
-
-🔌 FASE 6: Probar TCP Server
+ Probar TCP Server
 Método 1: Con PowerShell
 powershell# Crear cliente TCP
 $client = New-Object System.Net.Sockets.TcpClient("localhost", 9090)
