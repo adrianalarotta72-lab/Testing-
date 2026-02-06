@@ -1,242 +1,178 @@
- Probar TCP Server
-Método 1: Con PowerShell
-powershell# Crear cliente TCP
-$client = New-Object System.Net.Sockets.TcpClient("localhost", 9090)
-$stream = $client.GetStream()
-$writer = New-Object System.IO.StreamWriter($stream)
-$reader = New-Object System.IO.StreamReader($stream)
+package server
 
-# Enviar comando SET
-$writer.WriteLine('{"operation":"SET","key":"tcp-test","value":"Hello TCP"}')
-$writer.Flush()
-$response = $reader.ReadLine()
-Write-Host "Response: $response"
+import (
+	"encoding/json"
+	"log"
+	"net/http"
 
-# Enviar comando GET
-$writer.WriteLine('{"operation":"GET","key":"tcp-test"}')
-$writer.Flush()
-$response = $reader.ReadLine()
-Write-Host "Response: $response"
+	"technical-challenge-1-key-value-store/internal/store"
+	"technical-challenge-1-key-value-store/pkg/api"
+)
 
-# Cerrar
-$client.Close()
-Método 2: Con Netcat (si lo tienes instalado)
-powershell# Descargar netcat de: https://eternallybored.org/misc/netcat/
-# Luego:
-echo '{"operation":"GET","key":"tcp-test"}' | nc localhost 9090
-
-📡 FASE 7: Probar UDP Server
-Con PowerShell
-powershell# Crear cliente UDP
-$client = New-Object System.Net.Sockets.UdpClient
-$client.Connect("localhost", 9091)
-
-# Enviar comando
-$message = '{"operation":"SET","key":"udp-test","value":"Hello UDP"}'
-$bytes = [System.Text.Encoding]::ASCII.GetBytes($message)
-$client.Send($bytes, $bytes.Length)
-
-# Recibir respuesta
-$endpoint = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
-$receivedBytes = $client.Receive([ref]$endpoint)
-$response = [System.Text.Encoding]::ASCII.GetString($receivedBytes)
-Write-Host "Response: $response"
-
-# Cerrar
-$client.Close()
-
-🔄 FASE 8: Test de Integración (CRÍTICO)
-Este prueba que los 3 protocolos comparten el mismo store.
-Script Completo de Integración
-Guarda esto como test_integration.ps1:
-powershellWrite-Host "`n========================================" -ForegroundColor Cyan
-Write-Host "  INTEGRATION TEST - Cross-Protocol" -ForegroundColor Cyan
-Write-Host "========================================`n" -ForegroundColor Cyan
-
-# 1. Escribir via HTTP
-Write-Host "[1] Writing via HTTP..." -ForegroundColor Yellow
-$result = Invoke-WebRequest -Method POST -Uri "http://localhost:8080/kv" `
-  -ContentType "application/json" `
-  -Body '{"operation":"SET","key":"integration","value":"Cross-Protocol Works!"}' | 
-  Select-Object -ExpandProperty Content
-Write-Host "    $result" -ForegroundColor Green
-
-# 2. Leer via TCP
-Write-Host "[2] Reading via TCP..." -ForegroundColor Yellow
-$client = New-Object System.Net.Sockets.TcpClient("localhost", 9090)
-$stream = $client.GetStream()
-$writer = New-Object System.IO.StreamWriter($stream)
-$reader = New-Object System.IO.StreamReader($stream)
-$writer.WriteLine('{"operation":"GET","key":"integration"}')
-$writer.Flush()
-$response = $reader.ReadLine()
-Write-Host "    $response" -ForegroundColor Green
-$client.Close()
-
-# 3. Verificar SIZE via HTTP
-Write-Host "[3] Checking SIZE via HTTP..." -ForegroundColor Yellow
-$result = Invoke-WebRequest -Method POST -Uri "http://localhost:8080/kv" `
-  -ContentType "application/json" `
-  -Body '{"operation":"SIZE"}' | 
-  Select-Object -ExpandProperty Content
-Write-Host "    $result" -ForegroundColor Green
-
-# 4. Leer via UDP
-Write-Host "[4] Reading via UDP..." -ForegroundColor Yellow
-$udpClient = New-Object System.Net.Sockets.UdpClient
-$udpClient.Connect("localhost", 9091)
-$message = '{"operation":"GET","key":"integration"}'
-$bytes = [System.Text.Encoding]::ASCII.GetBytes($message)
-$udpClient.Send($bytes, $bytes.Length)
-$endpoint = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
-$receivedBytes = $udpClient.Receive([ref]$endpoint)
-$response = [System.Text.Encoding]::ASCII.GetString($receivedBytes)
-Write-Host "    $response" -ForegroundColor Green
-$udpClient.Close()
-
-Write-Host "`n========================================" -ForegroundColor Cyan
-Write-Host "  SUCCESS! All protocols share data" -ForegroundColor Green
-Write-Host "========================================`n" -ForegroundColor Cyan
-Ejecutar:
-powershell.\test_integration.ps1
-
-📝 FASE 9: Script de Testing Completo
-Guarda esto como test_all.ps1:
-powershell#Requires -Version 5.0
-
-$ErrorActionPreference = "Stop"
-
-Write-Host "`n" -NoNewline
-Write-Host "=========================================" -ForegroundColor Cyan
-Write-Host "   COMPLETE TEST SUITE" -ForegroundColor Cyan
-Write-Host "=========================================" -ForegroundColor Cyan
-Write-Host "`n"
-
-$passed = 0
-$failed = 0
-
-function Test-Step {
-    param($Name, $ScriptBlock)
-    
-    Write-Host "Testing: $Name..." -ForegroundColor Yellow -NoNewline
-    
-    try {
-        & $ScriptBlock
-        Write-Host " PASS" -ForegroundColor Green
-        $script:passed++
-    } catch {
-        Write-Host " FAIL" -ForegroundColor Red
-        Write-Host "  Error: $_" -ForegroundColor Red
-        $script:failed++
-    }
+// HTTPServer handles HTTP requests for the KV store
+type HTTPServer struct {
+	port int
 }
 
-# Test 1: Unit Tests
-Test-Step "Unit Tests" {
-    $result = go test ./... 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "Unit tests failed" }
+// NewHTTPServer creates a new HTTP server
+func NewHTTPServer(port int) *HTTPServer {
+	return &HTTPServer{
+		port: port,
+	}
 }
 
-# Test 2: Race Detector
-Test-Step "Race Detector" {
-    $result = go test -race ./internal/store 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "Race detector found issues" }
+// Start starts the HTTP server
+func (h *HTTPServer) Start() error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/kv", h.handleRequest)
+	mux.HandleFunc("/health", h.handleHealth)
+
+	addr := ":8080"
+	log.Printf("HTTP server listening on %s", addr)
+
+	return http.ListenAndServe(addr, mux)
 }
 
-# Test 3: Benchmarks
-Test-Step "Benchmarks" {
-    $result = go test -bench=. -benchtime=1s ./internal/store 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "Benchmarks failed" }
+func (h *HTTPServer) handleRequest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req api.Request
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.sendErrorResponse(w, "Invalid request format", http.StatusBadRequest)
+		return
+	}
+
+	resp := h.processRequest(&req)
+	h.sendJSONResponse(w, resp)
 }
 
-# Test 4: Build
-Test-Step "Build" {
-    $result = go build -o bin/kvstore-test.exe ./cmd/kvstore 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "Build failed" }
-    if (!(Test-Path bin/kvstore-test.exe)) { throw "Binary not created" }
+func (h *HTTPServer) processRequest(req *api.Request) api.Response {
+	switch req.Operation {
+	case api.OpSet:
+		return h.handleSet(req)
+	case api.OpUpdate:
+		return h.handleUpdate(req)
+	case api.OpGet:
+		return h.handleGet(req)
+	case api.OpDelete:
+		return h.handleDelete(req)
+	case api.OpExists:
+		return h.handleExists(req)
+	case api.OpSize:
+		return h.handleSize()
+	case api.OpClear:
+		return h.handleClear()
+	default:
+		return api.Response{
+			Success: false,
+			Error:   "Unknown operation",
+		}
+	}
 }
 
-# Test 5: Start Server
-Write-Host "`nStarting server for integration tests..." -ForegroundColor Yellow
-$serverProcess = Start-Process -FilePath ".\bin\kvstore-test.exe" -PassThru -WindowStyle Hidden
-Start-Sleep -Seconds 3
+func (h *HTTPServer) handleSet(req *api.Request) api.Response {
+	err := store.Set(req.Key, req.Value)
+	if err != nil {
+		return api.Response{
+			Success: false,
+			Error:   err.Error(),
+		}
+	}
 
-if (!$serverProcess.HasExited) {
-    Write-Host "Server started (PID: $($serverProcess.Id))" -ForegroundColor Green
-    
-    # Test 6: HTTP Health
-    Test-Step "HTTP Health Check" {
-        $result = curl http://localhost:8080/health 2>&1
-        if ($result -notmatch "OK") { throw "Health check failed" }
-    }
-    
-    # Test 7: HTTP SET
-    Test-Step "HTTP SET" {
-        $result = Invoke-WebRequest -Method POST -Uri "http://localhost:8080/kv" `
-          -ContentType "application/json" `
-          -Body '{"operation":"SET","key":"test","value":"works"}' |
-          Select-Object -ExpandProperty Content
-        if ($result -notmatch '"success":true') { throw "SET failed" }
-    }
-    
-    # Test 8: HTTP GET
-    Test-Step "HTTP GET" {
-        $result = Invoke-WebRequest -Method POST -Uri "http://localhost:8080/kv" `
-          -ContentType "application/json" `
-          -Body '{"operation":"GET","key":"test"}' |
-          Select-Object -ExpandProperty Content
-        if ($result -notmatch '"value":"works"') { throw "GET failed" }
-    }
-    
-    # Test 9: TCP Connection
-    Test-Step "TCP Connection" {
-        $client = New-Object System.Net.Sockets.TcpClient("localhost", 9090)
-        $stream = $client.GetStream()
-        $writer = New-Object System.IO.StreamWriter($stream)
-        $reader = New-Object System.IO.StreamReader($stream)
-        $writer.WriteLine('{"operation":"SIZE"}')
-        $writer.Flush()
-        $response = $reader.ReadLine()
-        $client.Close()
-        if ($response -notmatch '"success":true') { throw "TCP failed" }
-    }
-    
-    # Test 10: UDP Connection
-    Test-Step "UDP Connection" {
-        $client = New-Object System.Net.Sockets.UdpClient
-        $client.Connect("localhost", 9091)
-        $message = '{"operation":"SIZE"}'
-        $bytes = [System.Text.Encoding]::ASCII.GetBytes($message)
-        $client.Send($bytes, $bytes.Length)
-        $endpoint = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
-        $receivedBytes = $client.Receive([ref]$endpoint)
-        $response = [System.Text.Encoding]::ASCII.GetString($receivedBytes)
-        $client.Close()
-        if ($response -notmatch '"success":true') { throw "UDP failed" }
-    }
-    
-    # Stop server
-    Stop-Process -Id $serverProcess.Id -Force
-    Write-Host "Server stopped" -ForegroundColor Yellow
-} else {
-    Write-Host "Server failed to start" -ForegroundColor Red
-    $failed++
+	return api.Response{
+		Success: true,
+	}
 }
 
-# Cleanup
-Remove-Item bin/kvstore-test.exe -ErrorAction SilentlyContinue
+func (h *HTTPServer) handleUpdate(req *api.Request) api.Response {
+	err := store.Update(req.Key, req.Value)
+	if err != nil {
+		return api.Response{
+			Success: false,
+			Error:   err.Error(),
+		}
+	}
 
-Write-Host "`n" -NoNewline
-Write-Host "=========================================" -ForegroundColor Cyan
-Write-Host "   RESULTS" -ForegroundColor Cyan
-Write-Host "=========================================" -ForegroundColor Cyan
-Write-Host "Passed: $passed" -ForegroundColor Green
-Write-Host "Failed: $failed" -ForegroundColor $(if ($failed -eq 0) { "Green" } else { "Red" })
-Write-Host "=========================================" -ForegroundColor Cyan
-Write-Host "`n"
-
-if ($failed -gt 0) {
-    exit 1
+	return api.Response{
+		Success: true,
+	}
 }
-Ejecutar:
-powershell.\test_all.ps1
+
+func (h *HTTPServer) handleGet(req *api.Request) api.Response {
+	value, err := store.Get(req.Key)
+	if err != nil {
+		return api.Response{
+			Success: false,
+			Error:   err.Error(),
+		}
+	}
+
+	return api.Response{
+		Success: true,
+		Value:   value,
+	}
+}
+
+func (h *HTTPServer) handleDelete(req *api.Request) api.Response {
+	err := store.Delete(req.Key)
+	if err != nil {
+		return api.Response{
+			Success: false,
+			Error:   err.Error(),
+		}
+	}
+
+	return api.Response{
+		Success: true,
+	}
+}
+
+func (h *HTTPServer) handleExists(req *api.Request) api.Response {
+	exists := store.Exists(req.Key)
+	value := "false"
+	if exists {
+		value = "true"
+	}
+
+	return api.Response{
+		Success: true,
+		Value:   value,
+	}
+}
+
+func (h *HTTPServer) handleSize() api.Response {
+	size := store.Size()
+	return api.Response{
+		Success: true,
+		Size:    size,
+	}
+}
+
+func (h *HTTPServer) handleClear() api.Response {
+	store.Clear()
+	return api.Response{
+		Success: true,
+	}
+}
+
+func (h *HTTPServer) handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
+
+func (h *HTTPServer) sendJSONResponse(w http.ResponseWriter, resp api.Response) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (h *HTTPServer) sendErrorResponse(w http.ResponseWriter, message string, statusCode int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(api.Response{
+		Success: false,
+		Error:   message,
+	})
+}
