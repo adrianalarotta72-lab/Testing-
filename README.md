@@ -1,178 +1,225 @@
-package server
+package store
 
 import (
-	"encoding/json"
-	"log"
-	"net/http"
-
-	"technical-challenge-1-key-value-store/internal/store"
-	"technical-challenge-1-key-value-store/pkg/api"
+	"errors"
 )
 
-// HTTPServer handles HTTP requests for the KV store
-type HTTPServer struct {
-	port int
+// Errors
+var (
+	ErrKeyNotFound      = errors.New("key not found")
+	ErrEmptyKey         = errors.New("key cannot be empty")
+	ErrKeyAlreadyExists = errors.New("key already exists")
+)
+
+// StoreOperation representa una operación a realizar
+type StoreOperation struct {
+	Type     string // "SET", "UPDATE", "GET", "DELETE", "EXISTS", "SIZE", "CLEAR"
+	Key      string
+	Value    string
+	RespChan chan StoreResponse
 }
 
-// NewHTTPServer creates a new HTTP server
-func NewHTTPServer(port int) *HTTPServer {
-	return &HTTPServer{
-		port: port,
+// StoreResponse representa la respuesta de una operación
+type StoreResponse struct {
+	Value  string
+	Exists bool
+	Size   int
+	Error  error
+}
+
+// Canal global para operaciones del store
+var storeChan chan StoreOperation
+
+// init inicializa el canal y arranca el goroutine del store
+func init() {
+	storeChan = make(chan StoreOperation)
+	go run()
+}
+
+// run es el goroutine que procesa todas las operaciones
+// Solo este goroutine accede al map, por lo tanto no necesita mutex
+func run() {
+	data := make(map[string]string)
+
+	for op := range storeChan {
+		switch op.Type {
+		case "SET":
+			handleSet(data, op)
+		case "UPDATE":
+			handleUpdate(data, op)
+		case "GET":
+			handleGet(data, op)
+		case "DELETE":
+			handleDelete(data, op)
+		case "EXISTS":
+			handleExists(data, op)
+		case "SIZE":
+			handleSize(data, op)
+		case "CLEAR":
+			handleClear(data, op)
+		}
 	}
 }
 
-// Start starts the HTTP server
-func (h *HTTPServer) Start() error {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/kv", h.handleRequest)
-	mux.HandleFunc("/health", h.handleHealth)
-
-	addr := ":8080"
-	log.Printf("HTTP server listening on %s", addr)
-
-	return http.ListenAndServe(addr, mux)
-}
-
-func (h *HTTPServer) handleRequest(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+func handleSet(data map[string]string, op StoreOperation) {
+	if op.Key == "" {
+		op.RespChan <- StoreResponse{Error: ErrEmptyKey}
 		return
 	}
 
-	var req api.Request
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.sendErrorResponse(w, "Invalid request format", http.StatusBadRequest)
+	// Verifica si la key ya existe
+	if _, exists := data[op.Key]; exists {
+		op.RespChan <- StoreResponse{Error: ErrKeyAlreadyExists}
 		return
 	}
 
-	resp := h.processRequest(&req)
-	h.sendJSONResponse(w, resp)
+	data[op.Key] = op.Value
+	op.RespChan <- StoreResponse{Error: nil}
 }
 
-func (h *HTTPServer) processRequest(req *api.Request) api.Response {
-	switch req.Operation {
-	case api.OpSet:
-		return h.handleSet(req)
-	case api.OpUpdate:
-		return h.handleUpdate(req)
-	case api.OpGet:
-		return h.handleGet(req)
-	case api.OpDelete:
-		return h.handleDelete(req)
-	case api.OpExists:
-		return h.handleExists(req)
-	case api.OpSize:
-		return h.handleSize()
-	case api.OpClear:
-		return h.handleClear()
-	default:
-		return api.Response{
-			Success: false,
-			Error:   "Unknown operation",
-		}
+func handleUpdate(data map[string]string, op StoreOperation) {
+	if op.Key == "" {
+		op.RespChan <- StoreResponse{Error: ErrEmptyKey}
+		return
 	}
+
+	// Verifica si la key existe
+	if _, exists := data[op.Key]; !exists {
+		op.RespChan <- StoreResponse{Error: ErrKeyNotFound}
+		return
+	}
+
+	data[op.Key] = op.Value
+	op.RespChan <- StoreResponse{Error: nil}
 }
 
-func (h *HTTPServer) handleSet(req *api.Request) api.Response {
-	err := store.Set(req.Key, req.Value)
-	if err != nil {
-		return api.Response{
-			Success: false,
-			Error:   err.Error(),
-		}
+func handleGet(data map[string]string, op StoreOperation) {
+	if op.Key == "" {
+		op.RespChan <- StoreResponse{Error: ErrEmptyKey}
+		return
 	}
 
-	return api.Response{
-		Success: true,
+	value, exists := data[op.Key]
+	if !exists {
+		op.RespChan <- StoreResponse{Error: ErrKeyNotFound}
+		return
 	}
+
+	op.RespChan <- StoreResponse{Value: value, Error: nil}
 }
 
-func (h *HTTPServer) handleUpdate(req *api.Request) api.Response {
-	err := store.Update(req.Key, req.Value)
-	if err != nil {
-		return api.Response{
-			Success: false,
-			Error:   err.Error(),
-		}
+func handleDelete(data map[string]string, op StoreOperation) {
+	if op.Key == "" {
+		op.RespChan <- StoreResponse{Error: ErrEmptyKey}
+		return
 	}
 
-	return api.Response{
-		Success: true,
+	if _, exists := data[op.Key]; !exists {
+		op.RespChan <- StoreResponse{Error: ErrKeyNotFound}
+		return
 	}
+
+	delete(data, op.Key)
+	op.RespChan <- StoreResponse{Error: nil}
 }
 
-func (h *HTTPServer) handleGet(req *api.Request) api.Response {
-	value, err := store.Get(req.Key)
-	if err != nil {
-		return api.Response{
-			Success: false,
-			Error:   err.Error(),
-		}
-	}
-
-	return api.Response{
-		Success: true,
-		Value:   value,
-	}
+func handleExists(data map[string]string, op StoreOperation) {
+	_, exists := data[op.Key]
+	op.RespChan <- StoreResponse{Exists: exists, Error: nil}
 }
 
-func (h *HTTPServer) handleDelete(req *api.Request) api.Response {
-	err := store.Delete(req.Key)
-	if err != nil {
-		return api.Response{
-			Success: false,
-			Error:   err.Error(),
-		}
-	}
-
-	return api.Response{
-		Success: true,
-	}
+func handleSize(data map[string]string, op StoreOperation) {
+	op.RespChan <- StoreResponse{Size: len(data), Error: nil}
 }
 
-func (h *HTTPServer) handleExists(req *api.Request) api.Response {
-	exists := store.Exists(req.Key)
-	value := "false"
-	if exists {
-		value = "true"
+func handleClear(data map[string]string, op StoreOperation) {
+	for k := range data {
+		delete(data, k)
 	}
+	op.RespChan <- StoreResponse{Error: nil}
+}
 
-	return api.Response{
-		Success: true,
-		Value:   value,
+// === FUNCIONES PÚBLICAS A NIVEL DE PAQUETE ===
+
+// Set guarda un key-value (NO sobrescribe si ya existe)
+func Set(key, value string) error {
+	respChan := make(chan StoreResponse)
+	storeChan <- StoreOperation{
+		Type:     "SET",
+		Key:      key,
+		Value:    value,
+		RespChan: respChan,
 	}
+	resp := <-respChan
+	return resp.Error
 }
 
-func (h *HTTPServer) handleSize() api.Response {
-	size := store.Size()
-	return api.Response{
-		Success: true,
-		Size:    size,
+// Update actualiza un key-value existente (SÍ sobrescribe)
+func Update(key, value string) error {
+	respChan := make(chan StoreResponse)
+	storeChan <- StoreOperation{
+		Type:     "UPDATE",
+		Key:      key,
+		Value:    value,
+		RespChan: respChan,
 	}
+	resp := <-respChan
+	return resp.Error
 }
 
-func (h *HTTPServer) handleClear() api.Response {
-	store.Clear()
-	return api.Response{
-		Success: true,
+// Get obtiene el valor de una key
+func Get(key string) (string, error) {
+	respChan := make(chan StoreResponse)
+	storeChan <- StoreOperation{
+		Type:     "GET",
+		Key:      key,
+		RespChan: respChan,
 	}
+	resp := <-respChan
+	return resp.Value, resp.Error
 }
 
-func (h *HTTPServer) handleHealth(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+// Delete elimina una key
+func Delete(key string) error {
+	respChan := make(chan StoreResponse)
+	storeChan <- StoreOperation{
+		Type:     "DELETE",
+		Key:      key,
+		RespChan: respChan,
+	}
+	resp := <-respChan
+	return resp.Error
 }
 
-func (h *HTTPServer) sendJSONResponse(w http.ResponseWriter, resp api.Response) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+// Exists verifica si una key existe
+func Exists(key string) bool {
+	respChan := make(chan StoreResponse)
+	storeChan <- StoreOperation{
+		Type:     "EXISTS",
+		Key:      key,
+		RespChan: respChan,
+	}
+	resp := <-respChan
+	return resp.Exists
 }
 
-func (h *HTTPServer) sendErrorResponse(w http.ResponseWriter, message string, statusCode int) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
-	json.NewEncoder(w).Encode(api.Response{
-		Success: false,
-		Error:   message,
-	})
+// Size retorna el número de elementos
+func Size() int {
+	respChan := make(chan StoreResponse)
+	storeChan <- StoreOperation{
+		Type:     "SIZE",
+		RespChan: respChan,
+	}
+	resp := <-respChan
+	return resp.Size
+}
+
+// Clear elimina todos los elementos
+func Clear() {
+	respChan := make(chan StoreResponse)
+	storeChan <- StoreOperation{
+		Type:     "CLEAR",
+		RespChan: respChan,
+	}
+	<-respChan
 }
