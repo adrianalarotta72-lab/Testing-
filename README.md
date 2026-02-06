@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
 )
 
@@ -13,61 +14,74 @@ var (
 
 // StoreOperation representa una operación a realizar
 type StoreOperation struct {
-	Type     string // "SET", "UPDATE", "GET", "DELETE", "EXISTS", "SIZE", "CLEAR"
+	Type     string
 	Key      string
-	Value    string
+	Value    interface{} // Soporta cualquier tipo de dato
 	RespChan chan StoreResponse
 }
 
 // StoreResponse representa la respuesta de una operación
 type StoreResponse struct {
-	Value  string
+	Value  interface{} // Puede retornar cualquier tipo
 	Exists bool
 	Size   int
 	Error  error
 }
 
-// Canal global para operaciones del store
+// Canal global para las operaciones del store
 var storeChan chan StoreOperation
 
-// init inicializa el canal y arranca el goroutine del store
+// Canal para shutdown graceful
+var shutdownChan chan struct{}
+
+// init inicializa el store automáticamente cuando se importa el paquete
 func init() {
 	storeChan = make(chan StoreOperation)
-	go run()
+	shutdownChan = make(chan struct{})
+	go runStore()
 }
 
-// run es el goroutine que procesa todas las operaciones
-// Solo este goroutine accede al map, por lo tanto no necesita mutex
-func run() {
-	data := make(map[string]string)
+// runStore es el único goroutine que accede al map
+// Elimina completamente la necesidad de mutex
+func runStore() {
+	data := make(map[string]interface{}) // Soporta cualquier tipo
 
-	for op := range storeChan {
-		switch op.Type {
-		case "SET":
-			handleSet(data, op)
-		case "UPDATE":
-			handleUpdate(data, op)
-		case "GET":
-			handleGet(data, op)
-		case "DELETE":
-			handleDelete(data, op)
-		case "EXISTS":
-			handleExists(data, op)
-		case "SIZE":
-			handleSize(data, op)
-		case "CLEAR":
-			handleClear(data, op)
+	for {
+		select {
+		case op := <-storeChan:
+			switch op.Type {
+			case "SET":
+				handleSet(data, op)
+			case "UPDATE":
+				handleUpdate(data, op)
+			case "GET":
+				handleGet(data, op)
+			case "DELETE":
+				handleDelete(data, op)
+			case "EXISTS":
+				handleExists(data, op)
+			case "SIZE":
+				handleSize(data, op)
+			case "CLEAR":
+				handleClear(data, op)
+			}
+		case <-shutdownChan:
+			// Graceful shutdown
+			return
 		}
 	}
 }
 
-func handleSet(data map[string]string, op StoreOperation) {
+// === HANDLERS INTERNOS ===
+
+func handleSet(data map[string]interface{}, op StoreOperation) {
+	// Validación temprana (code review feedback)
 	if op.Key == "" {
 		op.RespChan <- StoreResponse{Error: ErrEmptyKey}
 		return
 	}
 
-	// Verifica si la key ya existe
+	// NO sobrescribe si existe
 	if _, exists := data[op.Key]; exists {
 		op.RespChan <- StoreResponse{Error: ErrKeyAlreadyExists}
 		return
@@ -77,13 +91,14 @@ func handleSet(data map[string]string, op StoreOperation) {
 	op.RespChan <- StoreResponse{Error: nil}
 }
 
-func handleUpdate(data map[string]string, op StoreOperation) {
+func handleUpdate(data map[string]interface{}, op StoreOperation) {
+	// Validación temprana
 	if op.Key == "" {
 		op.RespChan <- StoreResponse{Error: ErrEmptyKey}
 		return
 	}
 
-	// Verifica si la key existe
+	// SÍ sobrescribe, pero debe existir
 	if _, exists := data[op.Key]; !exists {
 		op.RespChan <- StoreResponse{Error: ErrKeyNotFound}
 		return
@@ -93,7 +108,8 @@ func handleUpdate(data map[string]string, op StoreOperation) {
 	op.RespChan <- StoreResponse{Error: nil}
 }
 
-func handleGet(data map[string]string, op StoreOperation) {
+func handleGet(data map[string]interface{}, op StoreOperation) {
+	// Validación temprana
 	if op.Key == "" {
 		op.RespChan <- StoreResponse{Error: ErrEmptyKey}
 		return
@@ -108,7 +124,8 @@ func handleGet(data map[string]string, op StoreOperation) {
 	op.RespChan <- StoreResponse{Value: value, Error: nil}
 }
 
-func handleDelete(data map[string]string, op StoreOperation) {
+func handleDelete(data map[string]interface{}, op StoreOperation) {
+	// Validación temprana
 	if op.Key == "" {
 		op.RespChan <- StoreResponse{Error: ErrEmptyKey}
 		return
@@ -123,16 +140,16 @@ func handleDelete(data map[string]string, op StoreOperation) {
 	op.RespChan <- StoreResponse{Error: nil}
 }
 
-func handleExists(data map[string]string, op StoreOperation) {
+func handleExists(data map[string]interface{}, op StoreOperation) {
 	_, exists := data[op.Key]
 	op.RespChan <- StoreResponse{Exists: exists, Error: nil}
 }
 
-func handleSize(data map[string]string, op StoreOperation) {
+func handleSize(data map[string]interface{}, op StoreOperation) {
 	op.RespChan <- StoreResponse{Size: len(data), Error: nil}
 }
 
-func handleClear(data map[string]string, op StoreOperation) {
+func handleClear(data map[string]interface{}, op StoreOperation) {
 	for k := range data {
 		delete(data, k)
 	}
@@ -142,7 +159,8 @@ func handleClear(data map[string]string, op StoreOperation) {
 // === FUNCIONES PÚBLICAS A NIVEL DE PAQUETE ===
 
 // Set guarda un key-value (NO sobrescribe si ya existe)
-func Set(key, value string) error {
+// Acepta cualquier tipo de dato como value (string, int, bool, map, slice, etc.)
+func Set(key string, value interface{}) error {
 	respChan := make(chan StoreResponse)
 	storeChan <- StoreOperation{
 		Type:     "SET",
@@ -155,7 +173,8 @@ func Set(key, value string) error {
 }
 
 // Update actualiza un key-value existente (SÍ sobrescribe)
-func Update(key, value string) error {
+// Acepta cualquier tipo de dato como value
+func Update(key string, value interface{}) error {
 	respChan := make(chan StoreResponse)
 	storeChan <- StoreOperation{
 		Type:     "UPDATE",
@@ -168,7 +187,8 @@ func Update(key, value string) error {
 }
 
 // Get obtiene el valor de una key
-func Get(key string) (string, error) {
+// Retorna interface{}, el llamador debe hacer type assertion
+func Get(key string) (interface{}, error) {
 	respChan := make(chan StoreResponse)
 	storeChan <- StoreOperation{
 		Type:     "GET",
@@ -177,6 +197,27 @@ func Get(key string) (string, error) {
 	}
 	resp := <-respChan
 	return resp.Value, resp.Error
+}
+
+// GetAsString obtiene el valor y lo convierte a string
+// Si el valor no es string, lo serializa como JSON
+func GetAsString(key string) (string, error) {
+	value, err := Get(key)
+	if err != nil {
+		return "", err
+	}
+
+	// Si ya es string, retornarlo directamente
+	if str, ok := value.(string); ok {
+		return str, nil
+	}
+
+	// Si es otro tipo, convertir a JSON
+	bytes, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	return string(bytes), nil
 }
 
 // Delete elimina una key
@@ -222,4 +263,9 @@ func Clear() {
 		RespChan: respChan,
 	}
 	<-respChan
+}
+
+// Shutdown cierra gracefully el store
+func Shutdown() {
+	close(shutdownChan)
 }
