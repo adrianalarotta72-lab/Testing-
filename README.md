@@ -1,271 +1,220 @@
-package store
+package server
 
 import (
+	"context"
 	"encoding/json"
-	"errors"
+	"log"
+	"net/http"
+	"time"
+
+	"technical-challenge-1-key-value-store/internal/store"
+	"technical-challenge-1-key-value-store/pkg/api"
 )
 
-// Errors
-var (
-	ErrKeyNotFound      = errors.New("key not found")
-	ErrEmptyKey         = errors.New("key cannot be empty")
-	ErrKeyAlreadyExists = errors.New("key already exists")
-)
-
-// StoreOperation representa una operación a realizar
-type StoreOperation struct {
-	Type     string
-	Key      string
-	Value    interface{} // Soporta cualquier tipo de dato
-	RespChan chan StoreResponse
+// HTTPServer handles HTTP requests for the KV store
+type HTTPServer struct {
+	port int
 }
 
-// StoreResponse representa la respuesta de una operación
-type StoreResponse struct {
-	Value  interface{} // Puede retornar cualquier tipo
-	Exists bool
-	Size   int
-	Error  error
+// NewHTTPServer creates a new HTTP server
+func NewHTTPServer(port int) *HTTPServer {
+	return &HTTPServer{
+		port: port,
+	}
 }
 
-// Canal global para las operaciones del store
-var storeChan chan StoreOperation
+// Start starts the HTTP server with graceful shutdown support
+func (h *HTTPServer) Start(ctx context.Context) error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/kv", h.handleRequest)
+	mux.HandleFunc("/health", h.handleHealth)
 
-// Canal para shutdown graceful
-var shutdownChan chan struct{}
+	addr := ":8080"
+	server := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
 
-// init inicializa el store automáticamente cuando se importa el paquete
-func init() {
-	storeChan = make(chan StoreOperation)
-	shutdownChan = make(chan struct{})
-	go runStore()
+	// Goroutine para shutdown graceful
+	go func() {
+		<-ctx.Done()
+		log.Println("HTTP server shutting down...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("HTTP server shutdown error: %v", err)
+		}
+	}()
+
+	log.Printf("HTTP server listening on %s", addr)
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
 }
 
-// runStore es el único goroutine que accede al map
-// Elimina completamente la necesidad de mutex
-func runStore() {
-	data := make(map[string]interface{}) // Soporta cualquier tipo
+func (h *HTTPServer) handleRequest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 
-	for {
-		select {
-		case op := <-storeChan:
-			switch op.Type {
-			case "SET":
-				handleSet(data, op)
-			case "UPDATE":
-				handleUpdate(data, op)
-			case "GET":
-				handleGet(data, op)
-			case "DELETE":
-				handleDelete(data, op)
-			case "EXISTS":
-				handleExists(data, op)
-			case "SIZE":
-				handleSize(data, op)
-			case "CLEAR":
-				handleClear(data, op)
-			}
-		case <-shutdownChan:
-			// Graceful shutdown
+	var req api.Request
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.sendErrorResponse(w, "Invalid request format", http.StatusBadRequest)
+		return
+	}
+
+	// Validación temprana de key vacía (code review feedback)
+	if req.Operation != api.OpSize && req.Operation != api.OpClear {
+		if req.Key == "" {
+			h.sendErrorResponse(w, "key cannot be empty", http.StatusBadRequest)
 			return
+		}
+	}
+
+	resp := h.processRequest(&req)
+	h.sendJSONResponse(w, resp)
+}
+
+func (h *HTTPServer) processRequest(req *api.Request) api.Response {
+	switch req.Operation {
+	case api.OpSet:
+		return h.handleSet(req)
+	case api.OpUpdate:
+		return h.handleUpdate(req)
+	case api.OpGet:
+		return h.handleGet(req)
+	case api.OpDelete:
+		return h.handleDelete(req)
+	case api.OpExists:
+		return h.handleExists(req)
+	case api.OpSize:
+		return h.handleSize()
+	case api.OpClear:
+		return h.handleClear()
+	default:
+		return api.Response{
+			Success: false,
+			Error:   "Unknown operation",
 		}
 	}
 }
 
-// === HANDLERS INTERNOS ===
-
-func handleSet(data map[string]interface{}, op StoreOperation) {
-	// Validación temprana (code review feedback)
-	if op.Key == "" {
-		op.RespChan <- StoreResponse{Error: ErrEmptyKey}
-		return
+func (h *HTTPServer) handleSet(req *api.Request) api.Response {
+	// Parsear el value JSON a interface{}
+	var value interface{}
+	if err := json.Unmarshal([]byte(req.Value), &value); err != nil {
+		// Si no es JSON válido, usar como string
+		value = req.Value
 	}
 
-	// NO sobrescribe si existe
-	if _, exists := data[op.Key]; exists {
-		op.RespChan <- StoreResponse{Error: ErrKeyAlreadyExists}
-		return
-	}
-
-	data[op.Key] = op.Value
-	op.RespChan <- StoreResponse{Error: nil}
-}
-
-func handleUpdate(data map[string]interface{}, op StoreOperation) {
-	// Validación temprana
-	if op.Key == "" {
-		op.RespChan <- StoreResponse{Error: ErrEmptyKey}
-		return
-	}
-
-	// SÍ sobrescribe, pero debe existir
-	if _, exists := data[op.Key]; !exists {
-		op.RespChan <- StoreResponse{Error: ErrKeyNotFound}
-		return
-	}
-
-	data[op.Key] = op.Value
-	op.RespChan <- StoreResponse{Error: nil}
-}
-
-func handleGet(data map[string]interface{}, op StoreOperation) {
-	// Validación temprana
-	if op.Key == "" {
-		op.RespChan <- StoreResponse{Error: ErrEmptyKey}
-		return
-	}
-
-	value, exists := data[op.Key]
-	if !exists {
-		op.RespChan <- StoreResponse{Error: ErrKeyNotFound}
-		return
-	}
-
-	op.RespChan <- StoreResponse{Value: value, Error: nil}
-}
-
-func handleDelete(data map[string]interface{}, op StoreOperation) {
-	// Validación temprana
-	if op.Key == "" {
-		op.RespChan <- StoreResponse{Error: ErrEmptyKey}
-		return
-	}
-
-	if _, exists := data[op.Key]; !exists {
-		op.RespChan <- StoreResponse{Error: ErrKeyNotFound}
-		return
-	}
-
-	delete(data, op.Key)
-	op.RespChan <- StoreResponse{Error: nil}
-}
-
-func handleExists(data map[string]interface{}, op StoreOperation) {
-	_, exists := data[op.Key]
-	op.RespChan <- StoreResponse{Exists: exists, Error: nil}
-}
-
-func handleSize(data map[string]interface{}, op StoreOperation) {
-	op.RespChan <- StoreResponse{Size: len(data), Error: nil}
-}
-
-func handleClear(data map[string]interface{}, op StoreOperation) {
-	for k := range data {
-		delete(data, k)
-	}
-	op.RespChan <- StoreResponse{Error: nil}
-}
-
-// === FUNCIONES PÚBLICAS A NIVEL DE PAQUETE ===
-
-// Set guarda un key-value (NO sobrescribe si ya existe)
-// Acepta cualquier tipo de dato como value (string, int, bool, map, slice, etc.)
-func Set(key string, value interface{}) error {
-	respChan := make(chan StoreResponse)
-	storeChan <- StoreOperation{
-		Type:     "SET",
-		Key:      key,
-		Value:    value,
-		RespChan: respChan,
-	}
-	resp := <-respChan
-	return resp.Error
-}
-
-// Update actualiza un key-value existente (SÍ sobrescribe)
-// Acepta cualquier tipo de dato como value
-func Update(key string, value interface{}) error {
-	respChan := make(chan StoreResponse)
-	storeChan <- StoreOperation{
-		Type:     "UPDATE",
-		Key:      key,
-		Value:    value,
-		RespChan: respChan,
-	}
-	resp := <-respChan
-	return resp.Error
-}
-
-// Get obtiene el valor de una key
-// Retorna interface{}, el llamador debe hacer type assertion
-func Get(key string) (interface{}, error) {
-	respChan := make(chan StoreResponse)
-	storeChan <- StoreOperation{
-		Type:     "GET",
-		Key:      key,
-		RespChan: respChan,
-	}
-	resp := <-respChan
-	return resp.Value, resp.Error
-}
-
-// GetAsString obtiene el valor y lo convierte a string
-// Si el valor no es string, lo serializa como JSON
-func GetAsString(key string) (string, error) {
-	value, err := Get(key)
+	err := store.Set(req.Key, value)
 	if err != nil {
-		return "", err
+		return api.Response{
+			Success: false,
+			Error:   err.Error(),
+		}
 	}
 
-	// Si ya es string, retornarlo directamente
-	if str, ok := value.(string); ok {
-		return str, nil
+	return api.Response{
+		Success: true,
+	}
+}
+
+func (h *HTTPServer) handleUpdate(req *api.Request) api.Response {
+	// Parsear el value JSON a interface{}
+	var value interface{}
+	if err := json.Unmarshal([]byte(req.Value), &value); err != nil {
+		// Si no es JSON válido, usar como string
+		value = req.Value
 	}
 
-	// Si es otro tipo, convertir a JSON
-	bytes, err := json.Marshal(value)
+	err := store.Update(req.Key, value)
 	if err != nil {
-		return "", err
+		return api.Response{
+			Success: false,
+			Error:   err.Error(),
+		}
 	}
-	return string(bytes), nil
+
+	return api.Response{
+		Success: true,
+	}
 }
 
-// Delete elimina una key
-func Delete(key string) error {
-	respChan := make(chan StoreResponse)
-	storeChan <- StoreOperation{
-		Type:     "DELETE",
-		Key:      key,
-		RespChan: respChan,
+func (h *HTTPServer) handleGet(req *api.Request) api.Response {
+	value, err := store.GetAsString(req.Key)
+	if err != nil {
+		return api.Response{
+			Success: false,
+			Error:   err.Error(),
+		}
 	}
-	resp := <-respChan
-	return resp.Error
+
+	return api.Response{
+		Success: true,
+		Value:   value,
+	}
 }
 
-// Exists verifica si una key existe
-func Exists(key string) bool {
-	respChan := make(chan StoreResponse)
-	storeChan <- StoreOperation{
-		Type:     "EXISTS",
-		Key:      key,
-		RespChan: respChan,
+func (h *HTTPServer) handleDelete(req *api.Request) api.Response {
+	err := store.Delete(req.Key)
+	if err != nil {
+		return api.Response{
+			Success: false,
+			Error:   err.Error(),
+		}
 	}
-	resp := <-respChan
-	return resp.Exists
+
+	return api.Response{
+		Success: true,
+	}
 }
 
-// Size retorna el número de elementos
-func Size() int {
-	respChan := make(chan StoreResponse)
-	storeChan <- StoreOperation{
-		Type:     "SIZE",
-		RespChan: respChan,
+func (h *HTTPServer) handleExists(req *api.Request) api.Response {
+	exists := store.Exists(req.Key)
+	value := "false"
+	if exists {
+		value = "true"
 	}
-	resp := <-respChan
-	return resp.Size
+
+	return api.Response{
+		Success: true,
+		Value:   value,
+	}
 }
 
-// Clear elimina todos los elementos
-func Clear() {
-	respChan := make(chan StoreResponse)
-	storeChan <- StoreOperation{
-		Type:     "CLEAR",
-		RespChan: respChan,
+func (h *HTTPServer) handleSize() api.Response {
+	size := store.Size()
+	return api.Response{
+		Success: true,
+		Size:    size,
 	}
-	<-respChan
 }
 
-// Shutdown cierra gracefully el store
-func Shutdown() {
-	close(shutdownChan)
+func (h *HTTPServer) handleClear() api.Response {
+	store.Clear()
+	return api.Response{
+		Success: true,
+	}
+}
+
+func (h *HTTPServer) handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
+
+func (h *HTTPServer) sendJSONResponse(w http.ResponseWriter, resp api.Response) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (h *HTTPServer) sendErrorResponse(w http.ResponseWriter, message string, statusCode int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(api.Response{
+		Success: false,
+		Error:   message,
+	})
 }
